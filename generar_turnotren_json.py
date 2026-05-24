@@ -396,6 +396,68 @@ def leer_recorrido_trip(zf, stops_map, trip_id):
     return sorted(filas, key=lambda x: x["stop_sequence"])
 
 
+
+def leer_recorridos_trips(zf, stops_map, trip_ids):
+    """
+    Lee stop_times.txt una sola vez para todos los trip_id que necesita la app.
+    Evita mezclar recorridos de un tren con otro.
+    """
+    trip_ids = set(str(x) for x in trip_ids if x)
+    recorridos = {tid: [] for tid in trip_ids}
+
+    if not trip_ids:
+        return recorridos
+
+    for row in iter_csv_zip(zf, "stop_times.txt"):
+        tid = row.get("trip_id", "")
+        if tid not in trip_ids:
+            continue
+
+        try:
+            seq = int(row.get("stop_sequence", ""))
+        except Exception:
+            continue
+
+        stop_id = row.get("stop_id", "")
+        arr = row.get("arrival_time", "")
+        dep = row.get("departure_time", "") or arr
+
+        recorridos[tid].append({
+            "stop_sequence": seq,
+            "stop_id": stop_id,
+            "stop_name": stops_map.get(stop_id, stop_id),
+            "arrival_time": hhmm(parse_hora(arr)),
+            "departure_time": hhmm(parse_hora(dep)),
+        })
+
+    for tid in list(recorridos.keys()):
+        recorridos[tid] = sorted(recorridos[tid], key=lambda x: x["stop_sequence"])
+
+    return recorridos
+
+
+def aplicar_extras_tren(tren_json, recorrido, vehicle_positions_json):
+    """
+    Añade datos específicos del tren seleccionado:
+    - origen real del tren completo
+    - destino final real del tren completo
+    - recorrido completo de ESE trip_id
+    - posición real solo de ESE trip_id
+    """
+    if tren_json is None:
+        return None
+
+    rec = recorrido or []
+    tren_json = dict(tren_json)
+
+    tren_json["origen_tren"] = rec[0]["stop_name"] if rec else ""
+    tren_json["destino_final_tren"] = rec[-1]["stop_name"] if rec else ""
+    tren_json["recorrido_completo"] = rec
+    tren_json["vehicle_position"] = buscar_vehicle_position(vehicle_positions_json, tren_json.get("trip_id", ""))
+
+    return tren_json
+
+
 def buscar_trip_update(trip_updates_json, trip_id, origen_stop_id, destino_stop_id):
     for ent in trip_updates_json.get("entity", []):
         tu = ent.get("tripUpdate", {})
@@ -725,11 +787,48 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
         estado = "SIN_DATO_REAL"
         mensaje = "No se ha encontrado tren directo real en GTFS."
 
-    primeros = [t for t in directos_hoy if t["salida_dt"] >= ahora][:80]
-    if len(primeros) < 80:
-        primeros += directos_manana[:80 - len(primeros)]
+    primeros = [t for t in directos_hoy if t["salida_dt"] >= ahora][:40]
+    if len(primeros) < 40:
+        primeros += directos_manana[:40 - len(primeros)]
 
-    recorrido_completo = leer_recorrido_trip(zf, stops_map, proximo["trip_id"]) if proximo else []
+    trip_ids_necesarios = set()
+    if proximo:
+        trip_ids_necesarios.add(proximo["trip_id"])
+
+    for t in primeros:
+        trip_ids_necesarios.add(t["trip_id"])
+
+    for info_turno in turnos.values():
+        tr = info_turno.get("tren")
+        if tr:
+            trip_ids_necesarios.add(tr.get("trip_id", ""))
+
+    recorridos_map = leer_recorridos_trips(zf, stops_map, trip_ids_necesarios)
+
+    if tren_final:
+        tren_final = aplicar_extras_tren(
+            tren_final,
+            recorridos_map.get(tren_final.get("trip_id", ""), []),
+            vehicle_positions
+        )
+
+    for clave_turno, info_turno in turnos.items():
+        tr = info_turno.get("tren")
+        if tr:
+            info_turno["tren"] = aplicar_extras_tren(
+                tr,
+                recorridos_map.get(tr.get("trip_id", ""), []),
+                vehicle_positions
+            )
+
+    primeros_json = []
+    for t in primeros:
+        tu_p = buscar_trip_update(trip_updates, t["trip_id"], origen_id, destino_id)
+        tj = aplicar_tiempo_real(t, tu_p)
+        tj = aplicar_extras_tren(tj, recorridos_map.get(t["trip_id"], []), vehicle_positions)
+        primeros_json.append(tj)
+
+    recorrido_completo = tren_final.get("recorrido_completo", []) if tren_final else []
 
     return {
         "clave": clave,
@@ -758,7 +857,7 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
         "vehicle_position": vp,
         "alertas": al,
         "recorrido_completo": recorrido_completo,
-        "primeros_directos": [limpiar_tren_lista(t) for t in primeros],
+        "primeros_directos": primeros_json,
     }
 
 
