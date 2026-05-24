@@ -365,6 +365,58 @@ def seleccionar_tren_despues_de_hora(directos_hoy, directos_manana, hora_hhmm, a
     return elegido
 
 
+
+def numero_tren_desde_texto(texto):
+    """
+    Extrae el número comercial del tren para poder emparejar:
+    - trip_id GTFS: 6141D32775C1
+    - vehicle label: C1-32775-PLATF.(1)
+    - entity id: VP_C1-32775
+    """
+    if texto is None:
+        return ""
+
+    s = str(texto).upper()
+
+    # C1-32775, C1_32775, etc.
+    m = re.search(r"C\d+\D+(\d{4,6})", s)
+    if m:
+        return m.group(1)
+
+    # 6141D32775C1 / 6141S32775C1
+    m = re.search(r"[A-Z](\d{4,6})C\d", s)
+    if m:
+        return m.group(1)
+
+    # Último recurso: números de 4-6 cifras.
+    nums = re.findall(r"\d{4,6}", s)
+    if nums:
+        # Preferimos el último porque en trip_id suele ser el número útil.
+        return nums[-1]
+
+    return ""
+
+
+def entidad_numero_tren(ent):
+    veh = ent.get("vehicle", {})
+    trip = veh.get("trip", {})
+    vehicle_info = veh.get("vehicle", {})
+
+    candidatos = [
+        ent.get("id", ""),
+        trip.get("tripId", ""),
+        vehicle_info.get("id", ""),
+        vehicle_info.get("label", ""),
+    ]
+
+    for c in candidatos:
+        n = numero_tren_desde_texto(c)
+        if n:
+            return n
+
+    return ""
+
+
 def leer_recorrido_trip(zf, stops_map, trip_id):
     """
     Devuelve todas las paradas reales del viaje según stop_times.txt.
@@ -453,7 +505,12 @@ def aplicar_extras_tren(tren_json, recorrido, vehicle_positions_json):
     tren_json["origen_tren"] = rec[0]["stop_name"] if rec else ""
     tren_json["destino_final_tren"] = rec[-1]["stop_name"] if rec else ""
     tren_json["recorrido_completo"] = rec
-    tren_json["vehicle_position"] = buscar_vehicle_position(vehicle_positions_json, tren_json.get("trip_id", ""))
+    tren_json["numero_tren"] = numero_tren_desde_texto(tren_json.get("trip_id", ""))
+    tren_json["vehicle_position"] = buscar_vehicle_position(
+        vehicle_positions_json,
+        tren_json.get("trip_id", ""),
+        [p.get("stop_id", "") for p in rec]
+    )
 
     return tren_json
 
@@ -500,21 +557,31 @@ def buscar_trip_update(trip_updates_json, trip_id, origen_stop_id, destino_stop_
     return {"encontrado": False}
 
 
-def buscar_vehicle_position(vehicle_positions_json, trip_id):
-    for ent in vehicle_positions_json.get("entity", []):
+def buscar_vehicle_position(vehicle_positions_json, trip_id, recorrido_stop_ids=None):
+    """
+    Busca posición real de un tren de forma segura.
+
+    Primero exige coincidencia exacta de trip_id.
+    Si Renfe usa un identificador distinto en vehicle_positions, acepta coincidencia
+    por número de tren solo si además el stop_id pertenece al recorrido del tren.
+    """
+    recorrido_stop_ids = set(str(x) for x in (recorrido_stop_ids or []) if x)
+    trip_id = str(trip_id or "")
+    numero_objetivo = numero_tren_desde_texto(trip_id)
+
+    def construir(ent, modo_match):
         veh = ent.get("vehicle", {})
         trip = veh.get("trip", {})
-
-        if trip.get("tripId") != trip_id:
-            continue
-
         pos = veh.get("position", {})
         vehicle_info = veh.get("vehicle", {})
-
         return {
             "encontrado": True,
+            "match": modo_match,
             "raw_id": ent.get("id", ""),
-            "trip_id": trip_id,
+            "trip_id": trip.get("tripId", ""),
+            "trip_id_objetivo": trip_id,
+            "numero_tren": entidad_numero_tren(ent) or numero_objetivo,
+            "numero_objetivo": numero_objetivo,
             "lat": pos.get("latitude"),
             "lon": pos.get("longitude"),
             "bearing": pos.get("bearing"),
@@ -526,8 +593,35 @@ def buscar_vehicle_position(vehicle_positions_json, trip_id):
             "label": vehicle_info.get("label"),
         }
 
-    return {"encontrado": False}
+    # 1) Coincidencia exacta.
+    for ent in vehicle_positions_json.get("entity", []):
+        veh = ent.get("vehicle", {})
+        trip = veh.get("trip", {})
+        if str(trip.get("tripId", "")) == trip_id:
+            return construir(ent, "trip_id_exacto")
 
+    # 2) Coincidencia segura por número de tren.
+    if numero_objetivo:
+        for ent in vehicle_positions_json.get("entity", []):
+            veh = ent.get("vehicle", {})
+            stop_id = str(veh.get("stopId", "") or "")
+            numero_entidad = entidad_numero_tren(ent)
+
+            if numero_entidad != numero_objetivo:
+                continue
+
+            # Seguridad: si tenemos recorrido, el stop debe pertenecer a ese tren.
+            if recorrido_stop_ids and stop_id and stop_id not in recorrido_stop_ids:
+                continue
+
+            return construir(ent, "numero_tren_y_stop")
+
+    return {
+        "encontrado": False,
+        "trip_id_objetivo": trip_id,
+        "numero_objetivo": numero_objetivo,
+        "motivo": "Renfe no publica vehicle_position coincidente para este tren"
+    }
 
 def extraer_texto_alerta(alert):
     desc = alert.get("descriptionText", {})
