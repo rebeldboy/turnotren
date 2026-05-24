@@ -1113,8 +1113,35 @@ def descubrir_endpoints_tiempo_real(salida):
         "ok": False,
         "scripts": [],
         "hints": [],
+        "snippets": [],
+        "ajax_calls": [],
         "error": "",
     }
+
+    claves = [
+        "CODTREN", "PARADAACTUAL", "PARADAANTERIOR", "PARADASIGUIENTE",
+        "VIAACTUAL", "VIASIGUIENTE", "RETRASO", "CODESTACION",
+        "NOMBREESTACION", "CIRCUL", "circul", "tren", "Tren",
+        "salidas", "llegadas", "Get", "get", "ajax", "$.ajax", ".post", ".get",
+        "url:", "service", "Service", "estacion", "Estacion"
+    ]
+
+    def extraer_snippets(nombre, texto):
+        encontrados = []
+        for clave in claves:
+            for m in re.finditer(re.escape(clave), texto):
+                ini = max(0, m.start() - 260)
+                fin = min(len(texto), m.end() + 260)
+                snip = texto[ini:fin]
+                snip = re.sub(r"\s+", " ", snip).strip()
+                encontrados.append({
+                    "source": nombre,
+                    "clave": clave,
+                    "snippet": snip
+                })
+                if len(encontrados) > 500:
+                    return encontrados
+        return encontrados
 
     try:
         req = urllib.request.Request(base_url, headers={"User-Agent": "TurnoTren/diagnostico"})
@@ -1124,50 +1151,117 @@ def descubrir_endpoints_tiempo_real(salida):
         resultado["ok"] = True
         scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I)
         scripts = [urljoin(base_url, s) for s in scripts]
-        resultado["scripts"] = scripts[:80]
+        resultado["scripts"] = scripts[:100]
 
-        patrones = [
-            r'https?://[^"\'\\\s]+',
-            r'["\']([^"\']*(?:api|Api|servicio|Servicio|tren|Tren|cercan|Cercan|posicion|Posicion|circul|Circul|estacion|Estacion|parada|Parada)[^"\']*)["\']',
-            r'["\']([^"\']*\.(?:json|geojson|php|ashx|aspx|svc)[^"\']*)["\']',
-        ]
+        textos = [{"source": "index.html", "url": base_url, "text": html}]
 
-        textos = [html]
-        for js_url in scripts[:25]:
+        for js_url in scripts[:40]:
             try:
                 req_js = urllib.request.Request(js_url, headers={"User-Agent": "TurnoTren/diagnostico"})
                 with urllib.request.urlopen(req_js, timeout=20) as rj:
                     js = rj.read().decode("utf-8", errors="replace")
-                textos.append(js)
+                textos.append({"source": js_url.split("/")[-1], "url": js_url, "text": js})
             except Exception as e:
                 resultado["hints"].append({"script_error": js_url, "error": f"{type(e).__name__}: {e}"})
 
+        # Hints generales: URLs/rutas sospechosas.
+        patrones = [
+            r'https?://[^"\'\\\s]+',
+            r'["\']([^"\']*(?:api|Api|servicio|Servicio|tren|Tren|cercan|Cercan|posicion|Posicion|circul|Circul|estacion|Estacion|parada|Parada|salida|Salida|llegada|Llegada)[^"\']*)["\']',
+            r'["\']([^"\']*\.(?:json|geojson|php|ashx|aspx|svc)[^"\']*)["\']',
+        ]
+
         hints = []
-        for idx, texto in enumerate(textos):
+        ajax_calls = []
+        snippets = []
+
+        for idx, item in enumerate(textos):
+            nombre = item["source"]
+            texto = item["text"]
+
+            snippets.extend(extraer_snippets(nombre, texto))
+
+            # Capturas de $.ajax / $.get / $.post con algo de contexto.
+            for pat in [r'\$\.ajax\s*\((.{0,1200}?)\)\s*;', r'\$\.get\s*\((.{0,800}?)\)\s*;', r'\$\.post\s*\((.{0,800}?)\)\s*;']:
+                for m in re.finditer(pat, texto, flags=re.S):
+                    snip = re.sub(r"\s+", " ", m.group(0)).strip()
+                    ajax_calls.append({"source": nombre, "snippet": snip[:1600]})
+
             for pat in patrones:
                 for m in re.findall(pat, texto):
                     if isinstance(m, tuple):
                         m = m[0]
                     s = str(m)
-                    if len(s) < 3 or len(s) > 300:
+                    if len(s) < 3 or len(s) > 350:
                         continue
-                    if any(x in s.lower() for x in ["api", "tren", "cercan", "posicion", "circul", "estacion", "json", "geojson", "parada"]):
-                        hints.append({"source_index": idx, "text": s})
+                    if any(x in s.lower() for x in ["api", "tren", "cercan", "posicion", "circul", "estacion", "json", "geojson", "parada", "salida", "llegada"]):
+                        hints.append({"source_index": idx, "source": nombre, "text": s})
 
+        # dedupe preservando orden
         vistos = set()
         limpios = []
         for h in hints:
-            k = h["text"]
+            k = (h.get("source"), h["text"])
             if k not in vistos:
                 vistos.add(k)
                 limpios.append(h)
-        resultado["hints"] = limpios[:500]
+
+        vistos_s = set()
+        snippets_limpios = []
+        for s in snippets:
+            k = (s["source"], s["clave"], s["snippet"])
+            if k not in vistos_s:
+                vistos_s.add(k)
+                snippets_limpios.append(s)
+
+        resultado["hints"] = limpios[:800]
+        resultado["snippets"] = snippets_limpios[:800]
+        resultado["ajax_calls"] = ajax_calls[:200]
 
     except Exception as e:
         resultado["error"] = f"{type(e).__name__}: {e}"
 
-    log(f"Diagnóstico visor Renfe tiempo-real: {'OK' if resultado['ok'] else 'ERROR'} · scripts {len(resultado.get('scripts', []))} · hints {len(resultado.get('hints', []))}", salida)
+    log(f"Diagnóstico visor Renfe tiempo-real: {'OK' if resultado['ok'] else 'ERROR'} · scripts {len(resultado.get('scripts', []))} · hints {len(resultado.get('hints', []))} · snippets {len(resultado.get('snippets', []))} · ajax {len(resultado.get('ajax_calls', []))}", salida)
     return resultado
+
+
+def escribir_debug_tiempo_real_txt(path, debug):
+    lineas = []
+    lineas.append("DIAGNÓSTICO RENFE TIEMPO REAL")
+    lineas.append("=" * 80)
+    lineas.append(f"Base URL: {debug.get('base_url')}")
+    lineas.append(f"OK: {debug.get('ok')}")
+    lineas.append(f"Error: {debug.get('error')}")
+    lineas.append("")
+
+    lineas.append("SCRIPTS")
+    lineas.append("-" * 80)
+    for s in debug.get("scripts", []):
+        lineas.append(str(s))
+    lineas.append("")
+
+    lineas.append("AJAX / GET / POST DETECTADOS")
+    lineas.append("-" * 80)
+    for a in debug.get("ajax_calls", []):
+        lineas.append(f"[{a.get('source')}] {a.get('snippet')}")
+        lineas.append("")
+
+    lineas.append("HINTS / RUTAS SOSPECHOSAS")
+    lineas.append("-" * 80)
+    for h in debug.get("hints", []):
+        lineas.append(f"[{h.get('source')}] {h.get('text')}")
+    lineas.append("")
+
+    lineas.append("SNIPPETS POR PALABRAS CLAVE")
+    lineas.append("-" * 80)
+    for s in debug.get("snippets", []):
+        lineas.append(f"[{s.get('source')}] clave={s.get('clave')}")
+        lineas.append(str(s.get("snippet")))
+        lineas.append("")
+
+    path.write_text("\n".join(lineas), encoding="utf-8")
+
+
 
 
 def main():
@@ -1275,6 +1369,7 @@ def main():
         }, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+    escribir_debug_tiempo_real_txt(PUBLIC_DIR / "turnotren_debug_realtime.txt", debug_tiempo_real_renfe)
     REPORTE_SALIDA.write_text("\n".join(salida), encoding="utf-8")
     escribir_index()
 
