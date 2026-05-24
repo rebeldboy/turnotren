@@ -527,7 +527,181 @@ def leer_recorridos_trips(zf, stops_map, trip_ids):
     return recorridos
 
 
-def aplicar_extras_tren(tren_json, recorrido, vehicle_positions_json):
+
+URL_RENFE_FLOTA_BASES = [
+    "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/flota.json?v=",
+    "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/flota.json?",
+    "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/flota.json",
+    "https://tiempo-real.renfe.com/renfe-visor/flota.json?v=",
+    "https://tiempo-real.renfe.com/renfe-visor/flota.json?",
+    "https://tiempo-real.renfe.com/renfe-visor/flota.json",
+]
+
+
+def descargar_flota_renfe(salida):
+    """
+    Fuente que usa el visor web de Renfe Cercanías.
+    El JS del visor llama a urlTrenes + flota.json + timestamp.
+    """
+    unix = str(int(time.time() * 1000))
+    errores = []
+
+    for base in URL_RENFE_FLOTA_BASES:
+        url = base + unix if base.endswith(("?v=", "?")) else base
+        try:
+            data = descargar_json(url, timeout=20, intentos=3, salida=salida, nombre="renfe_flota")
+            trenes = extraer_lista_trenes_flota(data)
+            log(f"  renfe_flota: OK · {len(trenes)} trenes · {url}", salida)
+            return data, True, url
+        except Exception as e:
+            errores.append(f"{url} -> {type(e).__name__}: {e}")
+
+    log("  renfe_flota: ERROR · no se ha podido leer flota.json", salida)
+    for e in errores[:6]:
+        log(f"    {e}", salida)
+
+    return {"trenes": [], "errores": errores}, False, ""
+
+
+def extraer_lista_trenes_flota(data):
+    if isinstance(data, dict):
+        for key in ("trenes", "features", "data", "items"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
+def get_any(d, *names, default=""):
+    if not isinstance(d, dict):
+        return default
+
+    # Directo
+    for n in names:
+        if n in d and d[n] not in (None, ""):
+            return d[n]
+
+    # Case-insensitive
+    lower = {str(k).lower(): v for k, v in d.items()}
+    for n in names:
+        v = lower.get(str(n).lower())
+        if v not in (None, ""):
+            return v
+
+    # GeoJSON properties
+    props = d.get("properties")
+    if isinstance(props, dict):
+        return get_any(props, *names, default=default)
+
+    return default
+
+
+def flota_numero_tren(item):
+    candidatos = [
+        get_any(item, "CODTREN", "codTren", "codtren", "numeroTren", "numero_tren", "trainNumber"),
+        get_any(item, "tripId", "TRIPID", "trip_id"),
+        get_any(item, "id", "ID"),
+    ]
+    for c in candidatos:
+        n = numero_tren_desde_texto(c)
+        if n:
+            return n
+    return ""
+
+
+def coordenadas_flota(item):
+    # GeoJSON
+    geom = item.get("geometry") if isinstance(item, dict) else None
+    if isinstance(geom, dict):
+        coords = geom.get("coordinates")
+        if isinstance(coords, list) and len(coords) >= 2:
+            try:
+                return float(coords[1]), float(coords[0])
+            except Exception:
+                pass
+
+    lat = get_any(item, "lat", "LAT", "latitud", "LATITUD", "latitude", "Latitude")
+    lon = get_any(item, "lon", "LON", "lng", "longitud", "LONGITUD", "longitude", "Longitude")
+    try:
+        if lat not in ("", None) and lon not in ("", None):
+            return float(lat), float(lon)
+    except Exception:
+        pass
+
+    return None, None
+
+
+def normalizar_item_flota(item):
+    lat, lon = coordenadas_flota(item)
+    numero = flota_numero_tren(item)
+
+    return {
+        "encontrado": True,
+        "fuente": "renfe_flota",
+        "numero_tren": numero,
+        "trip_id": str(get_any(item, "tripId", "TRIPID", "trip_id", default="")),
+        "cod_tren": str(get_any(item, "CODTREN", "codTren", "codtren", default=numero)),
+        "linea": str(get_any(item, "LINEA", "linea", "line", default="")),
+        "origen": str(get_any(item, "ORIGEN", "origen", default="")),
+        "destino": str(get_any(item, "DESTINO", "destino", default="")),
+        "parada_actual": str(get_any(item, "PARADAACTUAL", "paradaActual", "parada_actual", "actual", default="")),
+        "parada_anterior": str(get_any(item, "PARADAANTERIOR", "paradaAnterior", "parada_anterior", "anterior", default="")),
+        "parada_siguiente": str(get_any(item, "PARADASIGUIENTE", "paradaSiguiente", "parada_siguiente", "siguiente", default="")),
+        "via_actual": str(get_any(item, "VIAACTUAL", "viaActual", "via_actual", default="")),
+        "via_anterior": str(get_any(item, "VIAACTUALANT", "viaActualAnt", "via_anterior", default="")),
+        "via_siguiente": str(get_any(item, "VIASIGUIENTE", "viaSiguiente", "via_siguiente", default="")),
+        "retraso": str(get_any(item, "RETRASO", "retraso", "delay", "variacion", default="")),
+        "estado": str(get_any(item, "ESTADO", "estado", "status", default="")),
+        "lat": lat,
+        "lon": lon,
+        "raw_keys": list(item.keys()) if isinstance(item, dict) else [],
+    }
+
+
+def buscar_seguimiento_flota(flota_json, trip_id):
+    numero_objetivo = numero_tren_desde_texto(trip_id)
+    candidatos = []
+
+    for item in extraer_lista_trenes_flota(flota_json):
+        numero = flota_numero_tren(item)
+        if numero:
+            candidatos.append({
+                "numero_tren": numero,
+                "trip_id": str(get_any(item, "tripId", "TRIPID", "trip_id", default="")),
+                "origen": str(get_any(item, "ORIGEN", "origen", default="")),
+                "destino": str(get_any(item, "DESTINO", "destino", default="")),
+                "parada_actual": str(get_any(item, "PARADAACTUAL", "paradaActual", default="")),
+                "parada_siguiente": str(get_any(item, "PARADASIGUIENTE", "paradaSiguiente", default="")),
+            })
+
+        if numero and numero == numero_objetivo:
+            seg = normalizar_item_flota(item)
+            seg["match"] = "numero_tren"
+            seg["trip_id_objetivo"] = trip_id
+            return seg
+
+        trip_flota = str(get_any(item, "tripId", "TRIPID", "trip_id", default=""))
+        if trip_flota and trip_flota == str(trip_id):
+            seg = normalizar_item_flota(item)
+            seg["match"] = "trip_id"
+            seg["trip_id_objetivo"] = trip_id
+            return seg
+
+    return {
+        "encontrado": False,
+        "fuente": "renfe_flota",
+        "trip_id_objetivo": trip_id,
+        "numero_objetivo": numero_objetivo,
+        "motivo": "No aparece en flota.json del visor Renfe",
+        "debug_candidatos": candidatos[:40],
+    }
+
+
+def aplicar_extras_tren(tren_json, recorrido, vehicle_positions_json, flota_json=None):
     """
     Añade datos específicos del tren seleccionado:
     - origen real del tren completo
@@ -550,6 +724,7 @@ def aplicar_extras_tren(tren_json, recorrido, vehicle_positions_json):
         tren_json.get("trip_id", ""),
         [p.get("stop_id", "") for p in rec]
     )
+    tren_json["seguimiento_real"] = buscar_seguimiento_flota(flota_json or {}, tren_json.get("trip_id", ""))
 
     return tren_json
 
@@ -837,7 +1012,7 @@ def quitar_campos_datetime(d):
     return limpio
 
 
-def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows, alerts, trip_updates, vehicle_positions, clave, nombre, origen_id, destino_id, origen_nombre, destino_nombre, ahora, salida):
+def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows, alerts, trip_updates, vehicle_positions, flota_renfe, clave, nombre, origen_id, destino_id, origen_nombre, destino_nombre, ahora, salida):
     hoy = ahora.date()
     manana = hoy + timedelta(days=1)
 
@@ -959,7 +1134,8 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
         tren_final = aplicar_extras_tren(
             tren_final,
             recorridos_map.get(tren_final.get("trip_id", ""), []),
-            vehicle_positions
+            vehicle_positions,
+            flota_renfe
         )
 
     for clave_turno, info_turno in turnos.items():
@@ -968,14 +1144,15 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
             info_turno["tren"] = aplicar_extras_tren(
                 tr,
                 recorridos_map.get(tr.get("trip_id", ""), []),
-                vehicle_positions
+                vehicle_positions,
+                flota_renfe
             )
 
     primeros_json = []
     for t in primeros:
         tu_p = buscar_trip_update(trip_updates, t["trip_id"], origen_id, destino_id)
         tj = aplicar_tiempo_real(t, tu_p)
-        tj = aplicar_extras_tren(tj, recorridos_map.get(t["trip_id"], []), vehicle_positions)
+        tj = aplicar_extras_tren(tj, recorridos_map.get(t["trip_id"], []), vehicle_positions, flota_renfe)
         primeros_json.append(tj)
 
     recorrido_completo = tren_final.get("recorrido_completo", []) if tren_final else []
@@ -1299,6 +1476,9 @@ def main():
     else:
         log("Tiempo real Renfe: vehicle_positions NO disponible; no se podrá mostrar posición GPS.", salida)
 
+    log("Seguimiento visor Renfe:", salida)
+    flota_renfe, flota_renfe_ok, flota_renfe_url = descargar_flota_renfe(salida)
+
     with zipfile.ZipFile(GTFS_ZIP, "r") as zf:
         stops = leer_csv_zip(zf, "stops.txt")
         stops_map = {row.get("stop_id", ""): row.get("stop_name", "") for row in stops}
@@ -1308,12 +1488,12 @@ def main():
 
         rutas = [
             preparar_ruta(
-                zf, stops_map, trips, calendar, calendar_dates, alerts, trip_updates, vehicle_positions,
+                zf, stops_map, trips, calendar, calendar_dates, alerts, trip_updates, vehicle_positions, flota_renfe,
                 "casa_trabajo", "Tolosa → Billabona-Zizurkil",
                 STOP_TOLOSA, STOP_BILLABONA, NOMBRE_TOLOSA, NOMBRE_BILLABONA, ahora, salida
             ),
             preparar_ruta(
-                zf, stops_map, trips, calendar, calendar_dates, alerts, trip_updates, vehicle_positions,
+                zf, stops_map, trips, calendar, calendar_dates, alerts, trip_updates, vehicle_positions, flota_renfe,
                 "trabajo_casa", "Billabona-Zizurkil → Tolosa",
                 STOP_BILLABONA, STOP_TOLOSA, NOMBRE_BILLABONA, NOMBRE_TOLOSA, ahora, salida
             ),
@@ -1349,6 +1529,9 @@ def main():
             "alerts_ok": alerts_ok,
             "trip_updates_ok": trip_updates_ok,
             "vehicle_positions_ok": vehicle_positions_ok,
+            "renfe_flota_ok": flota_renfe_ok,
+            "renfe_flota_url": flota_renfe_url,
+            "renfe_flota_trenes": len(extraer_lista_trenes_flota(flota_renfe)),
             "alerts_entidades": len(alerts.get("entity", [])),
             "trip_updates_entidades": len(trip_updates.get("entity", [])),
             "vehicle_positions_entidades": len(vehicle_positions.get("entity", [])),
@@ -1356,6 +1539,12 @@ def main():
         "rutas": rutas,
         "debug_vehicle_positions": debug_vehicle_positions,
         "debug_tiempo_real_renfe": debug_tiempo_real_renfe,
+            "debug_renfe_flota": {
+                "ok": flota_renfe_ok,
+                "url": flota_renfe_url,
+                "total": len(extraer_lista_trenes_flota(flota_renfe)),
+                "muestras": [normalizar_item_flota(x) for x in extraer_lista_trenes_flota(flota_renfe)[:80]],
+            },
         "regla_seguridad": "CASA_TRABAJO: último tren cuya llegada <= entrada - 10 min. TRABAJO_CASA: primer tren cuya salida >= fin de turno. Si no hay dato real válido, mostrar SIN DATO y no inventar horarios."
     }
 
@@ -1366,6 +1555,12 @@ def main():
             "fuentes": resultado["fuentes"],
             "debug_vehicle_positions": debug_vehicle_positions,
             "debug_tiempo_real_renfe": debug_tiempo_real_renfe,
+            "debug_renfe_flota": {
+                "ok": flota_renfe_ok,
+                "url": flota_renfe_url,
+                "total": len(extraer_lista_trenes_flota(flota_renfe)),
+                "muestras": [normalizar_item_flota(x) for x in extraer_lista_trenes_flota(flota_renfe)[:80]],
+            },
         }, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
