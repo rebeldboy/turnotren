@@ -4,6 +4,7 @@ import json
 import re
 import zipfile
 import urllib.request
+from urllib.parse import urljoin
 from datetime import datetime, date, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1033,6 +1034,142 @@ def escribir_index():
 """, encoding="utf-8")
 
 
+
+def simplificar_vehicle_positions(vehicle_positions_json):
+    simplificados = []
+
+    for ent in vehicle_positions_json.get("entity", []):
+        veh = ent.get("vehicle", {})
+        trip = veh.get("trip", {})
+        pos = veh.get("position", {})
+        vehicle_info = veh.get("vehicle", {})
+
+        simplificados.append({
+            "id": ent.get("id", ""),
+            "trip_id": trip.get("tripId", ""),
+            "route_id": trip.get("routeId", ""),
+            "numero_desde_id": numero_tren_desde_texto(ent.get("id", "")),
+            "numero_desde_trip": numero_tren_desde_texto(trip.get("tripId", "")),
+            "numero_desde_vehicle_id": numero_tren_desde_texto(vehicle_info.get("id", "")),
+            "numero_desde_label": numero_tren_desde_texto(vehicle_info.get("label", "")),
+            "numero_detectado": entidad_numero_tren(ent),
+            "stop_id": veh.get("stopId", ""),
+            "current_status": veh.get("currentStatus", ""),
+            "timestamp": iso_desde_timestamp(veh.get("timestamp")),
+            "vehicle_id": vehicle_info.get("id", ""),
+            "label": vehicle_info.get("label", ""),
+            "lat": pos.get("latitude"),
+            "lon": pos.get("longitude"),
+            "raw_trip": trip,
+        })
+
+    return simplificados
+
+
+def diagnosticar_trenes_objetivo(trenes, vehicle_positions_json):
+    vehicles = simplificar_vehicle_positions(vehicle_positions_json)
+    salida = []
+
+    for tren in trenes:
+        if not tren:
+            continue
+
+        trip_id = tren.get("trip_id", "")
+        numero = tren.get("numero_tren") or numero_tren_desde_texto(trip_id)
+
+        exactos = [v for v in vehicles if v.get("trip_id") == trip_id]
+        por_numero = [v for v in vehicles if v.get("numero_detectado") == numero and numero]
+
+        cercanos = []
+        try:
+            n = int(numero)
+            for v in vehicles:
+                vn = v.get("numero_detectado", "")
+                if vn and vn.isdigit() and abs(int(vn) - n) <= 8:
+                    cercanos.append(v)
+        except Exception:
+            pass
+
+        salida.append({
+            "trip_id": trip_id,
+            "numero_tren": numero,
+            "salida": tren.get("salida_programada") or tren.get("salida_real", ""),
+            "llegada": tren.get("llegada_programada") or tren.get("llegada_real", ""),
+            "origen_tren": tren.get("origen_tren", ""),
+            "destino_final_tren": tren.get("destino_final_tren", ""),
+            "vehicle_position_actual": tren.get("vehicle_position", {}),
+            "matches_trip_id": exactos[:10],
+            "matches_numero": por_numero[:10],
+            "matches_cercanos_numero": cercanos[:20],
+        })
+
+    return salida
+
+
+def descubrir_endpoints_tiempo_real(salida):
+    base_url = "https://tiempo-real.renfe.com/"
+    resultado = {
+        "base_url": base_url,
+        "ok": False,
+        "scripts": [],
+        "hints": [],
+        "error": "",
+    }
+
+    try:
+        req = urllib.request.Request(base_url, headers={"User-Agent": "TurnoTren/diagnostico"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8", errors="replace")
+
+        resultado["ok"] = True
+        scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I)
+        scripts = [urljoin(base_url, s) for s in scripts]
+        resultado["scripts"] = scripts[:80]
+
+        patrones = [
+            r'https?://[^"\'\\\s]+',
+            r'["\']([^"\']*(?:api|Api|servicio|Servicio|tren|Tren|cercan|Cercan|posicion|Posicion|circul|Circul|estacion|Estacion|parada|Parada)[^"\']*)["\']',
+            r'["\']([^"\']*\.(?:json|geojson|php|ashx|aspx|svc)[^"\']*)["\']',
+        ]
+
+        textos = [html]
+        for js_url in scripts[:25]:
+            try:
+                req_js = urllib.request.Request(js_url, headers={"User-Agent": "TurnoTren/diagnostico"})
+                with urllib.request.urlopen(req_js, timeout=20) as rj:
+                    js = rj.read().decode("utf-8", errors="replace")
+                textos.append(js)
+            except Exception as e:
+                resultado["hints"].append({"script_error": js_url, "error": f"{type(e).__name__}: {e}"})
+
+        hints = []
+        for idx, texto in enumerate(textos):
+            for pat in patrones:
+                for m in re.findall(pat, texto):
+                    if isinstance(m, tuple):
+                        m = m[0]
+                    s = str(m)
+                    if len(s) < 3 or len(s) > 300:
+                        continue
+                    if any(x in s.lower() for x in ["api", "tren", "cercan", "posicion", "circul", "estacion", "json", "geojson", "parada"]):
+                        hints.append({"source_index": idx, "text": s})
+
+        vistos = set()
+        limpios = []
+        for h in hints:
+            k = h["text"]
+            if k not in vistos:
+                vistos.add(k)
+                limpios.append(h)
+        resultado["hints"] = limpios[:500]
+
+    except Exception as e:
+        resultado["error"] = f"{type(e).__name__}: {e}"
+
+    log(f"Diagnóstico visor Renfe tiempo-real: {'OK' if resultado['ok'] else 'ERROR'} · scripts {len(resultado.get('scripts', []))} · hints {len(resultado.get('hints', []))}", salida)
+    return resultado
+
+
 def main():
     salida = []
     PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -1088,6 +1225,25 @@ def main():
             ),
         ]
 
+    trenes_objetivo = []
+    for ruta in rutas:
+        if ruta.get("proximo_tren"):
+            trenes_objetivo.append(ruta["proximo_tren"])
+        for t in ruta.get("primeros_directos", [])[:12]:
+            trenes_objetivo.append(t)
+        for info in ruta.get("turnos", {}).values():
+            if info.get("tren"):
+                trenes_objetivo.append(info["tren"])
+
+    debug_vehicle_positions = {
+        "total": len(vehicle_positions.get("entity", [])),
+        "numeros_publicados": sorted({v.get("numero_detectado", "") for v in simplificar_vehicle_positions(vehicle_positions) if v.get("numero_detectado")}),
+        "muestras": simplificar_vehicle_positions(vehicle_positions)[:80],
+        "diagnostico_trenes_objetivo": diagnosticar_trenes_objetivo(trenes_objetivo, vehicle_positions),
+    }
+
+    debug_tiempo_real_renfe = descubrir_endpoints_tiempo_real(salida)
+
     resultado = {
         "app": "TurnoTren",
         "generado": ahora.isoformat(timespec="seconds"),
@@ -1096,15 +1252,29 @@ def main():
         "fuentes": {
             "gtfs_estatico": "OK",
             "tiempo_real": "OK" if rt_ok else "ERROR",
+            "alerts_ok": alerts_ok,
+            "trip_updates_ok": trip_updates_ok,
+            "vehicle_positions_ok": vehicle_positions_ok,
             "alerts_entidades": len(alerts.get("entity", [])),
             "trip_updates_entidades": len(trip_updates.get("entity", [])),
             "vehicle_positions_entidades": len(vehicle_positions.get("entity", [])),
         },
         "rutas": rutas,
+        "debug_vehicle_positions": debug_vehicle_positions,
+        "debug_tiempo_real_renfe": debug_tiempo_real_renfe,
         "regla_seguridad": "CASA_TRABAJO: último tren cuya llegada <= entrada - 10 min. TRABAJO_CASA: primer tren cuya salida >= fin de turno. Si no hay dato real válido, mostrar SIN DATO y no inventar horarios."
     }
 
     JSON_SALIDA.write_text(json.dumps(resultado, ensure_ascii=False, indent=2), encoding="utf-8")
+    (PUBLIC_DIR / "turnotren_debug_realtime.json").write_text(
+        json.dumps({
+            "generado": ahora.isoformat(timespec="seconds"),
+            "fuentes": resultado["fuentes"],
+            "debug_vehicle_positions": debug_vehicle_positions,
+            "debug_tiempo_real_renfe": debug_tiempo_real_renfe,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     REPORTE_SALIDA.write_text("\n".join(salida), encoding="utf-8")
     escribir_index()
 
