@@ -559,29 +559,40 @@ def buscar_trip_update(trip_updates_json, trip_id, origen_stop_id, destino_stop_
 
 def buscar_vehicle_position(vehicle_positions_json, trip_id, recorrido_stop_ids=None):
     """
-    Busca posición real de un tren de forma segura.
+    Busca posición real del tren.
 
-    Primero exige coincidencia exacta de trip_id.
-    Si Renfe usa un identificador distinto en vehicle_positions, acepta coincidencia
-    por número de tren solo si además el stop_id pertenece al recorrido del tren.
+    Cambios v1.7:
+    - Coincidencia exacta por trip_id si Renfe la publica.
+    - Si no hay exacta, coincidencia por número comercial del tren.
+      Ejemplo: 6141D32715C1 -> 32715 y C1-32715-PLATF.(1) -> 32715.
+    - Ya NO bloquea la posición si el stop_id no cruza con stop_times, porque
+      Renfe/Adif puede publicar una variante de stop_id o el vehículo puede venir
+      con stop_id de plataforma.
+    - Incluye debug para ver por qué se ha aceptado o no la posición.
     """
     recorrido_stop_ids = set(str(x) for x in (recorrido_stop_ids or []) if x)
     trip_id = str(trip_id or "")
     numero_objetivo = numero_tren_desde_texto(trip_id)
+
+    candidatos_debug = []
 
     def construir(ent, modo_match):
         veh = ent.get("vehicle", {})
         trip = veh.get("trip", {})
         pos = veh.get("position", {})
         vehicle_info = veh.get("vehicle", {})
+        stop_id = str(veh.get("stopId", "") or "")
+        numero_entidad = entidad_numero_tren(ent)
+
         return {
             "encontrado": True,
             "match": modo_match,
             "raw_id": ent.get("id", ""),
             "trip_id": trip.get("tripId", ""),
             "trip_id_objetivo": trip_id,
-            "numero_tren": entidad_numero_tren(ent) or numero_objetivo,
+            "numero_tren": numero_entidad or numero_objetivo,
             "numero_objetivo": numero_objetivo,
+            "stop_in_recorrido": (stop_id in recorrido_stop_ids) if stop_id else False,
             "lat": pos.get("latitude"),
             "lon": pos.get("longitude"),
             "bearing": pos.get("bearing"),
@@ -593,34 +604,40 @@ def buscar_vehicle_position(vehicle_positions_json, trip_id, recorrido_stop_ids=
             "label": vehicle_info.get("label"),
         }
 
-    # 1) Coincidencia exacta.
+    # 1) Coincidencia exacta por trip_id.
     for ent in vehicle_positions_json.get("entity", []):
         veh = ent.get("vehicle", {})
         trip = veh.get("trip", {})
         if str(trip.get("tripId", "")) == trip_id:
             return construir(ent, "trip_id_exacto")
 
-    # 2) Coincidencia segura por número de tren.
+    # 2) Coincidencia por número de tren.
     if numero_objetivo:
         for ent in vehicle_positions_json.get("entity", []):
             veh = ent.get("vehicle", {})
+            vehicle_info = veh.get("vehicle", {})
             stop_id = str(veh.get("stopId", "") or "")
             numero_entidad = entidad_numero_tren(ent)
 
-            if numero_entidad != numero_objetivo:
-                continue
+            if numero_entidad:
+                candidatos_debug.append({
+                    "id": ent.get("id", ""),
+                    "trip_id": veh.get("trip", {}).get("tripId", ""),
+                    "numero": numero_entidad,
+                    "label": vehicle_info.get("label", ""),
+                    "stop_id": stop_id,
+                    "stop_in_recorrido": (stop_id in recorrido_stop_ids) if stop_id else False,
+                })
 
-            # Seguridad: si tenemos recorrido, el stop debe pertenecer a ese tren.
-            if recorrido_stop_ids and stop_id and stop_id not in recorrido_stop_ids:
-                continue
-
-            return construir(ent, "numero_tren_y_stop")
+            if numero_entidad == numero_objetivo:
+                return construir(ent, "numero_tren")
 
     return {
         "encontrado": False,
         "trip_id_objetivo": trip_id,
         "numero_objetivo": numero_objetivo,
-        "motivo": "Renfe no publica vehicle_position coincidente para este tren"
+        "motivo": "Renfe no publica vehicle_position coincidente para este tren",
+        "debug_muestras": candidatos_debug[:12],
     }
 
 def extraer_texto_alerta(alert):
