@@ -81,11 +81,49 @@ def iter_csv_zip(zf, nombre):
         yield limpiar_row(r)
 
 
-def descargar_json(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": "TurnoTren/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        raw = response.read()
-    return json.loads(raw.decode("utf-8"))
+def descargar_json(url, timeout=20, intentos=3, salida=None, nombre="json"):
+    ultimo_error = None
+
+    for intento in range(1, intentos + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "TurnoTren/1.0",
+                    "Accept": "application/json,text/plain,*/*",
+                    "Cache-Control": "no-cache",
+                }
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw = response.read()
+
+            if len(raw) < 2:
+                raise RuntimeError(f"respuesta vacía ({len(raw)} bytes)")
+
+            texto = raw.decode("utf-8", errors="replace").strip()
+
+            # A veces Renfe devuelve un JSON truncado. Reintentamos antes de rendirnos.
+            if not (texto.startswith("{") or texto.startswith("[")):
+                raise RuntimeError(f"respuesta no parece JSON: {texto[:40]}")
+
+            return json.loads(texto)
+
+        except Exception as e:
+            ultimo_error = e
+            if salida is not None:
+                log(f"  {nombre}: intento {intento}/{intentos} fallido: {type(e).__name__}: {e}", salida)
+
+    raise ultimo_error
+
+
+def descargar_json_seguro(url, nombre, salida, timeout=20, intentos=3):
+    try:
+        data = descargar_json(url, timeout=timeout, intentos=intentos, salida=salida, nombre=nombre)
+        log(f"  {nombre}: OK · {len(data.get('entity', []))} entidades", salida)
+        return data, True
+    except Exception as e:
+        log(f"  {nombre}: ERROR {type(e).__name__}: {e}", salida)
+        return {"entity": [], "error": f"{type(e).__name__}: {e}"}, False
 
 
 def descargar_gtfs(salida):
@@ -1018,21 +1056,17 @@ def main():
         escribir_index()
         return
 
-    try:
-        alerts = descargar_json(URL_ALERTS)
-        trip_updates = descargar_json(URL_TRIP_UPDATES)
-        vehicle_positions = descargar_json(URL_VEHICLE_POSITIONS)
-        rt_ok = True
-        log("Tiempo real Renfe: OK", salida)
-        log(f"  alerts: {len(alerts.get('entity', []))} entidades", salida)
-        log(f"  trip_updates: {len(trip_updates.get('entity', []))} entidades", salida)
-        log(f"  vehicle_positions: {len(vehicle_positions.get('entity', []))} entidades", salida)
-    except Exception as e:
-        alerts = {"entity": []}
-        trip_updates = {"entity": []}
-        vehicle_positions = {"entity": []}
-        rt_ok = False
-        log(f"Tiempo real Renfe: ERROR {type(e).__name__}: {e}", salida)
+    log("Tiempo real Renfe:", salida)
+    alerts, alerts_ok = descargar_json_seguro(URL_ALERTS, "alerts", salida, timeout=20, intentos=3)
+    trip_updates, trip_updates_ok = descargar_json_seguro(URL_TRIP_UPDATES, "trip_updates", salida, timeout=20, intentos=3)
+    vehicle_positions, vehicle_positions_ok = descargar_json_seguro(URL_VEHICLE_POSITIONS, "vehicle_positions", salida, timeout=20, intentos=4)
+
+    rt_ok = alerts_ok or trip_updates_ok or vehicle_positions_ok
+
+    if vehicle_positions_ok:
+        log("Tiempo real Renfe: vehicle_positions disponible para posición real.", salida)
+    else:
+        log("Tiempo real Renfe: vehicle_positions NO disponible; no se podrá mostrar posición GPS.", salida)
 
     with zipfile.ZipFile(GTFS_ZIP, "r") as zf:
         stops = leer_csv_zip(zf, "stops.txt")
