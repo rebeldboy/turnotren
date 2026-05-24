@@ -569,6 +569,62 @@ def limpiar_tren_lista(t):
     }
 
 
+
+def validar_tren_turno_final(clave_ruta, info_turno, tren):
+    """
+    Verificación final antes de escribir el JSON.
+
+    CASA -> TRABAJO:
+      llegada_programada_iso <= entrada - 10 min
+
+    TRABAJO -> CASA:
+      salida_programada_iso >= salida trabajo
+    """
+    if tren is None:
+        return False, "SIN_TREN"
+
+    objetivo_txt = tren.get("objetivo_turno")
+    if not objetivo_txt:
+        return False, "SIN_OBJETIVO_TURNO"
+
+    objetivo = datetime.fromisoformat(objetivo_txt)
+
+    if clave_ruta == "casa_trabajo":
+        llegada = tren.get("llegada_dt")
+        llegada_maxima_txt = tren.get("llegada_maxima_turno")
+        llegada_maxima = datetime.fromisoformat(llegada_maxima_txt) if llegada_maxima_txt else objetivo - timedelta(minutes=MARGEN_ENTRADA_TRABAJO_MINUTOS)
+
+        if llegada is None:
+            return False, "SIN_LLEGADA"
+
+        if llegada <= llegada_maxima:
+            return True, f"OK llegada {llegada.strftime('%H:%M')} <= max {llegada_maxima.strftime('%H:%M')}"
+
+        return False, f"ERROR llegada {llegada.strftime('%H:%M')} > max {llegada_maxima.strftime('%H:%M')}"
+
+    if clave_ruta == "trabajo_casa":
+        salida = tren.get("salida_dt")
+
+        if salida is None:
+            return False, "SIN_SALIDA"
+
+        if salida >= objetivo:
+            return True, f"OK salida {salida.strftime('%H:%M')} >= min {objetivo.strftime('%H:%M')}"
+
+        return False, f"ERROR salida {salida.strftime('%H:%M')} < min {objetivo.strftime('%H:%M')}"
+
+    return False, "RUTA_DESCONOCIDA"
+
+
+def quitar_campos_datetime(d):
+    limpio = dict(d)
+    limpio.pop("salida_dt", None)
+    limpio.pop("llegada_dt", None)
+    limpio.pop("salida_seg", None)
+    limpio.pop("llegada_seg", None)
+    return limpio
+
+
 def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows, alerts, trip_updates, vehicle_positions, clave, nombre, origen_id, destino_id, origen_nombre, destino_nombre, ahora, salida):
     hoy = ahora.date()
     manana = hoy + timedelta(days=1)
@@ -594,11 +650,18 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
         else:
             tren_turno = seleccionar_tren_despues_de_hora(directos_hoy, directos_manana, info["hora"], ahora)
 
-        if tren_turno:
+        valido, detalle_validacion = validar_tren_turno_final(clave, info, tren_turno)
+
+        if tren_turno and valido:
             tu_turno = buscar_trip_update(trip_updates, tren_turno["trip_id"], origen_id, destino_id)
             tren_aplicado = aplicar_tiempo_real(tren_turno, tu_turno)
 
-            log(f"  TURNO {info['nombre']} ({info['tipo']} {info['hora']}): {tren_aplicado['salida_programada']} -> {tren_aplicado['llegada_programada']} · {tren_aplicado['trip_id']}", salida)
+            log(
+                f"  VERIFICADO {clave} / {info['nombre']} ({info['tipo']} {info['hora']}): "
+                f"{tren_aplicado['salida_programada']} -> {tren_aplicado['llegada_programada']} · "
+                f"{tren_aplicado['trip_id']} · {detalle_validacion}",
+                salida
+            )
 
             turnos[clave_turno] = {
                 "nombre": info["nombre"],
@@ -606,16 +669,37 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
                 "hora": info["hora"],
                 "criterio": tren_turno.get("criterio_turno", ""),
                 "margen_llegada_minutos": tren_turno.get("margen_llegada_minutos"),
+                "llegada_maxima_turno": tren_turno.get("llegada_maxima_turno"),
+                "verificacion": {
+                    "ok": True,
+                    "detalle": detalle_validacion,
+                    "ruta": clave,
+                    "turno": clave_turno,
+                    "hora_referencia": info["hora"],
+                },
                 "tren": tren_aplicado,
             }
         else:
-            log(f"  TURNO {info['nombre']} ({info['tipo']} {info['hora']}): SIN DATO REAL", salida)
+            log(
+                f"  BLOQUEADO {clave} / {info['nombre']} ({info['tipo']} {info['hora']}): "
+                f"{detalle_validacion}",
+                salida
+            )
+
             turnos[clave_turno] = {
                 "nombre": info["nombre"],
                 "tipo": info["tipo"],
                 "hora": info["hora"],
-                "criterio": "sin tren real válido para esta fecha/hora",
-                "margen_llegada_minutos": None,
+                "criterio": "sin tren real que cumpla las premisas",
+                "margen_llegada_minutos": MARGEN_ENTRADA_TRABAJO_MINUTOS if clave == "casa_trabajo" else None,
+                "llegada_maxima_turno": tren_turno.get("llegada_maxima_turno") if tren_turno else None,
+                "verificacion": {
+                    "ok": False,
+                    "detalle": detalle_validacion,
+                    "ruta": clave,
+                    "turno": clave_turno,
+                    "hora_referencia": info["hora"],
+                },
                 "tren": None,
             }
 
@@ -641,9 +725,9 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
         estado = "SIN_DATO_REAL"
         mensaje = "No se ha encontrado tren directo real en GTFS."
 
-    primeros = [t for t in directos_hoy if t["salida_dt"] >= ahora][:20]
-    if len(primeros) < 20:
-        primeros += directos_manana[:20 - len(primeros)]
+    primeros = [t for t in directos_hoy if t["salida_dt"] >= ahora][:80]
+    if len(primeros) < 80:
+        primeros += directos_manana[:80 - len(primeros)]
 
     recorrido_completo = leer_recorrido_trip(zf, stops_map, proximo["trip_id"]) if proximo else []
 
@@ -664,6 +748,12 @@ def preparar_ruta(zf, stops_map, trips_rows, calendar_rows, calendar_dates_rows,
         "trips_manana": trips_manana,
         "proximo_tren": tren_final,
         "turnos": turnos,
+        "verificacion_reglas": {
+            "casa_trabajo": "último tren con llegada <= entrada - 10 min",
+            "trabajo_casa": "primer tren con salida >= fin de turno",
+            "turnos_entrada": TURNOS_ENTRADA if clave == "casa_trabajo" else None,
+            "turnos_salida": TURNOS_VUELTA if clave == "trabajo_casa" else None,
+        },
         "trip_update": tu,
         "vehicle_position": vp,
         "alertas": al,
