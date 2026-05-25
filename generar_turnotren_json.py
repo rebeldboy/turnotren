@@ -529,39 +529,159 @@ def leer_recorridos_trips(zf, stops_map, trip_ids):
 
 
 
-URL_RENFE_FLOTA_BASES = [
-    "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/flota.json?v=",
-    "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/flota.json?",
-    "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/flota.json",
-    "https://tiempo-real.renfe.com/renfe-visor/flota.json?v=",
-    "https://tiempo-real.renfe.com/renfe-visor/flota.json?",
-    "https://tiempo-real.renfe.com/renfe-visor/flota.json",
-]
+URL_VISOR_RENFE = "https://tiempo-real.renfe.com/"
 
 
-def descargar_flota_renfe(salida):
+def descargar_texto(url, timeout=20):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "TurnoTren/2.5",
+            "Accept": "text/html,application/javascript,text/plain,*/*",
+            "Cache-Control": "no-cache",
+        }
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def descubrir_bases_flota_desde_visor(salida):
     """
-    Fuente que usa el visor web de Renfe Cercanías.
-    El JS del visor llama a urlTrenes + flota.json + timestamp.
+    Descubre dinámicamente el valor real de urlTrenes desde los JS del visor Renfe.
+    Así evitamos depender de una URL fija si Renfe cambia producción/desarrollo.
     """
+    bases = []
+    detalles = {
+        "ok": False,
+        "scripts": [],
+        "bases_detectadas": [],
+        "snippets_urlTrenes": [],
+        "error": "",
+    }
+
+    try:
+        html = descargar_texto(URL_VISOR_RENFE)
+        scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I)
+        scripts = [urljoin(URL_VISOR_RENFE, s) for s in scripts]
+        detalles["scripts"] = scripts
+
+        textos = [{"url": URL_VISOR_RENFE, "text": html}]
+        for js_url in scripts:
+            try:
+                js = descargar_texto(js_url)
+                textos.append({"url": js_url, "text": js})
+            except Exception as e:
+                detalles["snippets_urlTrenes"].append({
+                    "url": js_url,
+                    "error": f"{type(e).__name__}: {e}"
+                })
+
+        for item in textos:
+            texto = item["text"]
+            url = item["url"]
+
+            for pat in [
+                r'urlTrenes\s*=\s*["\']([^"\']+)["\']',
+                r'var\s+urlTrenes\s*=\s*["\']([^"\']+)["\']',
+                r'let\s+urlTrenes\s*=\s*["\']([^"\']+)["\']',
+                r'const\s+urlTrenes\s*=\s*["\']([^"\']+)["\']',
+            ]:
+                for m in re.finditer(pat, texto):
+                    base = urljoin(URL_VISOR_RENFE, m.group(1))
+                    bases.append(base)
+                    ini = max(0, m.start() - 300)
+                    fin = min(len(texto), m.end() + 300)
+                    detalles["snippets_urlTrenes"].append({
+                        "url": url,
+                        "match": m.group(0),
+                        "snippet": re.sub(r"\s+", " ", texto[ini:fin]).strip()
+                    })
+
+            for m in re.finditer(r'["\']([^"\']*renfe-visor/[^"\']*)["\']', texto):
+                s = urljoin(URL_VISOR_RENFE, m.group(1))
+                if "flota" in s.lower():
+                    bases.append(s.split("flota")[0])
+
+        bases.extend([
+            "https://tiempo-real.renfe.com/renfe-visor/",
+            "https://tiempo-real.renfe.com/renfe-visor/data/",
+            "https://grt-nginx-visor-publico.sir.renfe.es/renfe-visor/",
+            "https://grt-nginx-visor-publico.sir.renfe.es/renfe-visor/data/",
+            "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/",
+            "https://grt-nginx-visor-publico.desa.sir.renfe.es/renfe-visor/data/",
+        ])
+
+        clean = []
+        seen = set()
+        for b in bases:
+            if not b:
+                continue
+            if not b.endswith("/"):
+                b += "/"
+            if b not in seen:
+                seen.add(b)
+                clean.append(b)
+
+        detalles["ok"] = True
+        detalles["bases_detectadas"] = clean
+        return clean, detalles
+
+    except Exception as e:
+        detalles["error"] = f"{type(e).__name__}: {e}"
+        return [], detalles
+
+
+def probar_url_flota(base, salida):
     unix = str(int(time.time() * 1000))
-    errores = []
+    candidatos = [
+        urljoin(base, "flota.json?" + unix),
+        urljoin(base, "flota.json?v=" + unix),
+        urljoin(base, "flota.json"),
+        urljoin(base, "flota_anterior.json?" + unix),
+        urljoin(base, "flota_anterior.json?v=" + unix),
+        urljoin(base, "flota_anterior.json"),
+    ]
 
-    for base in URL_RENFE_FLOTA_BASES:
-        url = base + unix if base.endswith(("?v=", "?")) else base
+    errores = []
+    for url in candidatos:
         try:
-            data = descargar_json(url, timeout=20, intentos=3, salida=salida, nombre="renfe_flota")
+            data = descargar_json(url, timeout=20, intentos=2, salida=salida, nombre="renfe_flota")
             trenes = extraer_lista_trenes_flota(data)
-            log(f"  renfe_flota: OK · {len(trenes)} trenes · {url}", salida)
-            return data, True, url
+            if len(trenes) > 0:
+                return data, True, url, errores
+            errores.append(f"{url} -> JSON OK pero sin lista de trenes detectable")
         except Exception as e:
             errores.append(f"{url} -> {type(e).__name__}: {e}")
 
-    log("  renfe_flota: ERROR · no se ha podido leer flota.json", salida)
-    for e in errores[:6]:
+    return {"trenes": [], "errores": errores}, False, "", errores
+
+
+def descargar_flota_renfe(salida):
+    bases, discovery = descubrir_bases_flota_desde_visor(salida)
+    errores = []
+
+    for base in bases:
+        data, ok, url, errs = probar_url_flota(base, salida)
+        errores.extend(errs[:4])
+        if ok:
+            trenes = extraer_lista_trenes_flota(data)
+            log(f"  renfe_flota: OK · {len(trenes)} trenes · {url}", salida)
+            if isinstance(data, dict):
+                data["_turnotren_discovery"] = discovery
+                data["_turnotren_url_usada"] = url
+            return data, True, url
+
+    log("  renfe_flota: ERROR · no se ha podido leer flota.json real del visor", salida)
+    for e in errores[:16]:
         log(f"    {e}", salida)
 
-    return {"trenes": [], "errores": errores}, False, ""
+    return {
+        "trenes": [],
+        "errores": errores,
+        "_turnotren_discovery": discovery,
+    }, False, ""
+
 
 
 def extraer_lista_trenes_flota(data):
@@ -1562,6 +1682,50 @@ def main():
                 "total": len(extraer_lista_trenes_flota(flota_renfe)),
                 "muestras": [normalizar_item_flota(x) for x in extraer_lista_trenes_flota(flota_renfe)[:80]],
             },
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    (PUBLIC_DIR / "turnotren_flota_raw.json").write_text(
+        json.dumps({
+            "generado": ahora.isoformat(timespec="seconds"),
+            "ok": flota_renfe_ok,
+            "url": flota_renfe_url,
+            "total": len(extraer_lista_trenes_flota(flota_renfe)),
+            "discovery": flota_renfe.get("_turnotren_discovery", {}) if isinstance(flota_renfe, dict) else {},
+            "raw": flota_renfe,
+            "normalizado": [normalizar_item_flota(x) for x in extraer_lista_trenes_flota(flota_renfe)],
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    trenes_match = []
+    for ruta in rutas:
+        candidatos = []
+        if ruta.get("proximo_tren"):
+            candidatos.append(ruta.get("proximo_tren"))
+        candidatos.extend(ruta.get("primeros_directos", [])[:12])
+        for info in ruta.get("turnos", {}).values():
+            if info.get("tren"):
+                candidatos.append(info.get("tren"))
+
+        for t in candidatos:
+            if t:
+                trenes_match.append({
+                    "ruta": ruta.get("clave"),
+                    "trip_id": t.get("trip_id"),
+                    "numero_tren": t.get("numero_tren") or numero_tren_desde_texto(t.get("trip_id", "")),
+                    "salida": t.get("salida_real"),
+                    "llegada": t.get("llegada_real"),
+                    "vehicle_position": t.get("vehicle_position"),
+                    "seguimiento_real": t.get("seguimiento_real"),
+                })
+
+    (PUBLIC_DIR / "turnotren_match_tren_actual.json").write_text(
+        json.dumps({
+            "generado": ahora.isoformat(timespec="seconds"),
+            "renfe_flota_ok": flota_renfe_ok,
+            "renfe_flota_url": flota_renfe_url,
+            "trenes": trenes_match,
         }, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
