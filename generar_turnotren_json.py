@@ -685,16 +685,64 @@ def descargar_flota_renfe(salida):
 
 
 def extraer_lista_trenes_flota(data):
-    if isinstance(data, dict):
-        for key in ("trenes", "features", "data", "items"):
-            val = data.get(key)
-            if isinstance(val, list):
-                return val
+    """
+    Extrae una lista de trenes aunque flota.json venga anidado por núcleo/línea.
+    Antes solo mirábamos claves directas como trenes/features/data/items.
+    """
+    claves_directas = ("trenes", "features", "data", "items", "flota", "trains", "vehiculos", "vehicles")
+    claves_tren = {
+        "CODTREN", "codTren", "codtren", "numeroTren", "trainNumber",
+        "PARADAACTUAL", "paradaActual", "PARADAANTERIOR", "PARADASIGUIENTE",
+        "tripId", "trip_id", "lat", "lon", "latitud", "longitud"
+    }
 
-    if isinstance(data, list):
-        return data
+    def parece_tren_dict(d):
+        if not isinstance(d, dict):
+            return False
 
-    return []
+        keys = set(str(k) for k in d.keys())
+        if keys.intersection(claves_tren):
+            return True
+
+        props = d.get("properties")
+        if isinstance(props, dict) and set(str(k) for k in props.keys()).intersection(claves_tren):
+            return True
+
+        return False
+
+    def buscar(obj, profundidad=0):
+        if profundidad > 6:
+            return []
+
+        if isinstance(obj, list):
+            if any(parece_tren_dict(x) for x in obj[:20]):
+                return obj
+
+            for x in obj:
+                r = buscar(x, profundidad + 1)
+                if r:
+                    return r
+
+        if isinstance(obj, dict):
+            for key in claves_directas:
+                val = obj.get(key)
+                if isinstance(val, list):
+                    if any(parece_tren_dict(x) for x in val[:20]):
+                        return val
+
+                    r = buscar(val, profundidad + 1)
+                    if r:
+                        return r
+
+            for val in obj.values():
+                if isinstance(val, (dict, list)):
+                    r = buscar(val, profundidad + 1)
+                    if r:
+                        return r
+
+        return []
+
+    return buscar(data)
 
 
 def get_any(d, *names, default=""):
@@ -1562,6 +1610,218 @@ def escribir_debug_tiempo_real_txt(path, debug):
 
 
 
+def extraer_snippets_nucleos_visor(salida):
+    """
+    Descarga HTML/JS del visor y busca pistas de núcleo/línea/parámetros.
+    """
+    resultado = {
+        "ok": False,
+        "scripts": [],
+        "snippets": [],
+        "strings_sospechosas": [],
+        "error": "",
+    }
+
+    claves = [
+        "nucleo", "Nucleo", "núcleo", "NUCLEO", "codNucleo", "CODNUCLEO",
+        "linea", "Linea", "LINEA", "C1", "Donostia", "San Sebastián", "San Sebastian",
+        "Gipuzkoa", "Guipuzcoa", "Irun", "Irún", "Brinkola", "Brínkola",
+        "flota", "urlTrenes", "parada", "estacion"
+    ]
+
+    try:
+        html = descargar_texto(URL_VISOR_RENFE)
+        scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I)
+        scripts = [urljoin(URL_VISOR_RENFE, s) for s in scripts]
+        resultado["scripts"] = scripts
+
+        textos = [{"url": URL_VISOR_RENFE, "text": html}]
+        for js_url in scripts[:40]:
+            try:
+                textos.append({"url": js_url, "text": descargar_texto(js_url)})
+            except Exception as e:
+                resultado["snippets"].append({
+                    "url": js_url,
+                    "error": f"{type(e).__name__}: {e}"
+                })
+
+        snippets = []
+        strings = []
+
+        for item in textos:
+            url = item["url"]
+            texto = item["text"]
+
+            for clave in claves:
+                for m in re.finditer(re.escape(clave), texto, flags=re.I):
+                    ini = max(0, m.start() - 350)
+                    fin = min(len(texto), m.end() + 350)
+                    snippets.append({
+                        "url": url,
+                        "clave": clave,
+                        "snippet": re.sub(r"\s+", " ", texto[ini:fin]).strip()
+                    })
+                    if len(snippets) > 1200:
+                        break
+
+            # strings entre comillas que parezcan de núcleo/línea/API
+            for m in re.findall(r'["\']([^"\']{3,220})["\']', texto):
+                low = m.lower()
+                if any(k.lower() in low for k in ["nucleo", "línea", "linea", "donostia", "sebastian", "gipuz", "irun", "brinkola", "flota", "tren"]):
+                    strings.append({"url": url, "text": m})
+
+        # deduplicar
+        seen = set()
+        clean_snips = []
+        for s in snippets:
+            k = (s.get("url"), s.get("clave"), s.get("snippet"))
+            if k not in seen:
+                seen.add(k)
+                clean_snips.append(s)
+
+        seen = set()
+        clean_str = []
+        for s in strings:
+            k = (s.get("url"), s.get("text"))
+            if k not in seen:
+                seen.add(k)
+                clean_str.append(s)
+
+        resultado["ok"] = True
+        resultado["snippets"] = clean_snips[:800]
+        resultado["strings_sospechosas"] = clean_str[:800]
+
+    except Exception as e:
+        resultado["error"] = f"{type(e).__name__}: {e}"
+
+    log(f"Diagnóstico núcleos Renfe: {'OK' if resultado['ok'] else 'ERROR'} · snippets {len(resultado.get('snippets', []))}", salida)
+    return resultado
+
+
+def diagnosticar_flota_por_nucleo(salida, numeros_objetivo):
+    """
+    Prueba flota.json/flota_anterior.json con varias combinaciones de base, núcleo y línea.
+    Busca si aparecen los números objetivo, por ejemplo 32719.
+    """
+    numeros_objetivo = sorted({str(n) for n in numeros_objetivo if n})
+    bases, discovery = descubrir_bases_flota_desde_visor(salida)
+    ts = str(int(time.time() * 1000))
+
+    nucleos = [
+        "", "10", "20", "30", "40", "50", "60", "61", "62",
+        "SS", "SSE", "DONOSTIA", "SANSEBASTIAN", "SAN_SEBASTIAN",
+        "SAN-SEBASTIAN", "GIPUZKOA", "GUIPUZCOA", "IRUN", "BRINKOLA"
+    ]
+
+    lineas = ["", "C1", "C-1", "IRUN-BRINKOLA", "BRINKOLA-IRUN"]
+
+    rutas_extra = [
+        "flota.json",
+        "flota_anterior.json",
+        "data/flota.json",
+        "data/flota_anterior.json",
+        "nucleos/flota.json",
+        "nucleos/flota_anterior.json",
+    ]
+
+    pruebas = []
+    intentos = 0
+    max_intentos = 260
+
+    def construir_params(nucleo, linea):
+        params = [
+            "",
+            ts,
+            "v=" + ts,
+        ]
+        if nucleo:
+            params.extend([
+                f"nucleo={nucleo}&v={ts}",
+                f"codNucleo={nucleo}&v={ts}",
+                f"codigoNucleo={nucleo}&v={ts}",
+                f"nucleos={nucleo}&v={ts}",
+            ])
+        if linea:
+            params.extend([
+                f"linea={linea}&v={ts}",
+                f"line={linea}&v={ts}",
+                f"codLinea={linea}&v={ts}",
+            ])
+        if nucleo and linea:
+            params.extend([
+                f"nucleo={nucleo}&linea={linea}&v={ts}",
+                f"codNucleo={nucleo}&codLinea={linea}&v={ts}",
+            ])
+
+        # quitar duplicados
+        out = []
+        seen = set()
+        for p in params:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    for base in bases:
+        if intentos >= max_intentos:
+            break
+
+        for ruta in rutas_extra:
+            if intentos >= max_intentos:
+                break
+
+            url_base = urljoin(base, ruta)
+            for nucleo in nucleos:
+                if intentos >= max_intentos:
+                    break
+
+                for linea in lineas:
+                    if intentos >= max_intentos:
+                        break
+
+                    for param in construir_params(nucleo, linea):
+                        if intentos >= max_intentos:
+                            break
+
+                        intentos += 1
+                        url = url_base if param == "" else (url_base + "?" + param)
+
+                        try:
+                            data = descargar_json(url, timeout=12, intentos=1, salida=None, nombre="flota_nucleo")
+                            trenes = extraer_lista_trenes_flota(data)
+                            if not trenes:
+                                continue
+
+                            normalizados = [normalizar_item_flota(x) for x in trenes]
+                            numeros = sorted({x.get("numero_tren", "") for x in normalizados if x.get("numero_tren")})
+                            matches = [x for x in normalizados if x.get("numero_tren") in numeros_objetivo]
+
+                            pruebas.append({
+                                "url": url,
+                                "total": len(trenes),
+                                "numeros_muestra": numeros[:80],
+                                "numeros_objetivo": numeros_objetivo,
+                                "matches": matches[:20],
+                            })
+
+                            # Si ya hay match de todos o de alguno, priorizamos guardar y no saturar.
+                            if matches:
+                                log(f"  flota_nucleo: MATCH · {url} · {', '.join(x.get('numero_tren','') for x in matches[:5])}", salida)
+
+                        except Exception:
+                            pass
+
+    return {
+        "objetivos": numeros_objetivo,
+        "intentos": intentos,
+        "bases": bases,
+        "discovery": discovery,
+        "pruebas_con_trenes": pruebas[:120],
+        "matches": [m for p in pruebas for m in p.get("matches", [])],
+    }
+
+
+
 def main():
     salida = []
     PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -1729,6 +1989,27 @@ def main():
         }, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+    numeros_objetivo_nucleos = sorted({t.get("numero_tren", "") for t in trenes_match if t.get("numero_tren")})
+    debug_nucleos = extraer_snippets_nucleos_visor(salida)
+    debug_flota_nucleos = diagnosticar_flota_por_nucleo(salida, numeros_objetivo_nucleos)
+
+    (PUBLIC_DIR / "turnotren_nucleos_detectados.json").write_text(
+        json.dumps({
+            "generado": ahora.isoformat(timespec="seconds"),
+            "numeros_objetivo": numeros_objetivo_nucleos,
+            "debug_nucleos": debug_nucleos,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    (PUBLIC_DIR / "turnotren_flota_por_nucleo.json").write_text(
+        json.dumps({
+            "generado": ahora.isoformat(timespec="seconds"),
+            "diagnostico": debug_flota_nucleos,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
     escribir_debug_tiempo_real_txt(PUBLIC_DIR / "turnotren_debug_realtime.txt", debug_tiempo_real_renfe)
     REPORTE_SALIDA.write_text("\n".join(salida), encoding="utf-8")
     escribir_index()
